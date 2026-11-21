@@ -1,49 +1,40 @@
-# Hardware Neural Network Accelerator for MNIST Digit Classification on FPGA
+Rozpoznawanie cyfr na FPGA: sprzętowy akcelerator sieci neuronowej
 
-VHDL-93, simulated in GHDL (all three testbenches pass).
+Płytka: Digilent Nexys A7-100T (układ AMD/Xilinx Artix-7)
+Języki i narzędzia: VHDL-2008, Python (numpy), Vivado 2026, GHDL
+Status: projekt w realizacji. Wyniki poniżej pochodzą z symulacji; synteza i test na płytce są w toku.
 
-## Files
-rtl/aes_pkg.vhd, aes_core.vhd        AES-128 encrypt, iterative, 11 clocks/block, optional `wipe` input
-rtl/uart_rx.vhd, uart_tx.vhd         UART 8N1, 115200 @ 100 MHz
-rtl/fifo_sync.vhd                    32-byte RX FIFO (first-word-fall-through, overrun pulse)
-rtl/aes_uart_ctrl.vhd                command FSM: CTR mode, nonce discipline, wipe, timeouts
-rtl/aes_uart_top.vhd                 top for the Nexys A7: UART -> FIFO -> FSM -> AES -> UART
-rtl/uart_echo_top.vhd                step-1 top (UART echo), kept for bring-up
-sim/tb_aes_core.vhd                  27 AES vectors + latency check
-sim/tb_uart_echo.vhd                 echo test
-sim/tb_aes_uart.vhd                  end-to-end test over the serial line, 10 test groups
-constr/nexys_a7_100t_aes_uart.xdc    pins for aes_uart_top (and ..._uart_echo.xdc for the echo top)
-scripts/run_sim.sh                   runs all three testbenches in GHDL
-scripts/aes_uart_test.py             hardware test (pyserial + pycryptodome)
-scripts/uart_echo_test.py            echo test for bring-up
+Układ FPGA rozpoznaje ręcznie pisane cyfry (0–9). Komputer wysyła obrazek cyfry przez kabel USB, płytka oblicza, jaka to cyfra, pokazuje wynik na wyświetlaczu i odsyła go do komputera.
 
-## Protocol (ACK = 0x06, NAK = 0x15; multi-byte fields first byte first)
-'K' + 16 B key             -> ACK   loads key, INVALIDATES the counter
-'N' + 16 B counter block   -> ACK   needs a key
-'C' + 16 B data            -> 16 B  data xor AES_K(counter), counter += 1 (128-bit, big endian);
-                                    needs key + counter; same command encrypts and decrypts
-'Z'                        -> ACK   wipes key, counter and all working registers
-Unknown byte, missing precondition (payload is still consumed), or a frame stalled for 100 ms -> NAK.
+Obliczenia wykonuje własny, zaprojektowany od zera układ cyfrowy. Nie ma tu procesora ani gotowych bloków IP.
 
-## Security properties (what is implemented, and what is not claimed)
-Implemented, and checked in simulation:
-- CTR mode instead of ECB; the counter is a 128-bit register that increments after every block.
-- Counter discipline: no `C` without a counter, and a new key invalidates the counter.
-- Key is write-only (no command reads it back); wiped by reset and by `Z`, together with the AES
-  working registers (state, round key), the byte shift register and the counter.
-- Frame timeout and payload skipping on rejected commands (no payload misread as commands).
-- AES latency is a constant 11 clocks for every input (asserted for all 27 test vectors).
-## LEDs
-0 key loaded | 1 counter loaded | 2 NAK sent (sticky) | 3 RX FIFO overrun (sticky)
-4 UART framing error (sticky) | 5 AES busy | 7..6 processed blocks mod 4.  Reset: red CPU_RESETN button.
+ Komputer (Python)                         Płytka FPGA (VHDL)
+┌─────────────────┐   obrazek 28x28   ┌──────────────────────────────┐
+│ wysyła obrazek  │ ────────────────► │ sieć neuronowa w sprzęcie    │
+│ sprawdza wynik  │ ◄──────────────── │ wynik → wyświetlacz + LED    │
+└─────────────────┘   cyfra + dane    └──────────────────────────────┘
+1. Training	Python	Mała sieć neuronowa (MLP 784 → 64 → 10) uczy się na zbiorze MNIST (70 000 obrazków cyfr).
+2. Quantization	Python	Wagi sieci zamieniane są z ułamków na 8-bitowe liczby całkowite (int8), które FPGA liczy szybko i tanio.
+3. Eksport	Python	Wagi (ok. 50 KB) zapisywane są do plików, które Vivado wpisuje do pamięci BRAM układu.
+4. Inference	FPGA	Blok MAC (mnożenie + dodawanie) w każdym takcie zegara przetwarza jeden piksel. Na końcu blok argmax wybiera cyfrę z najwyższym wynikiem.
+5. Komunikacja	FPGA ↔ PC	Obrazek przychodzi przez UART, a wynik wraca tą samą drogą i pojawia się na wyświetlaczu 7-segmentowym.
 
-## Vivado
-1. Project for xc7a100tcsg324-1; add rtl/*.vhd as design sources, sim/*.vhd as simulation sources.
-2. Simulation: tb_aes_core / tb_uart_echo / tb_aes_uart -> Run Behavioral Simulation -> Run All
-   (tb_aes_uart is ~130 ms of simulated serial traffic; set the run time to "all" and give it time).
-3. Hardware: top = aes_uart_top, constraints = constr/nexys_a7_100t_aes_uart.xdc, bitstream, program.
-4. python3 scripts/aes_uart_test.py /dev/ttyUSB1
-   After synthesis record: LUT/FF usage, worst slack at 100 MHz (the AES round is the critical path).
+Wyniki (symulacja)
+Parametr	Wynik
+Skuteczność sieci (float, przed kwantyzacją)	97,51% na 10 000 obrazków testowych
+Skuteczność sieci (int8, tak jak w sprzęcie)	97,55%, czyli kwantyzacja nie pogorszyła wyniku
+Czas rozpoznania jednej cyfry	ok. 508 µs (50 826 taktów zegara 100 MHz)
+Zgodność sprzętu z modelem w Pythonie	100%: wszystkie testy zgodne bit po bicie
+Rozmiar wag	ok. 50 KB, czyli ok. 8% pamięci BRAM układu
+Jak sprawdzana jest poprawność?
 
-## GHDL
-sh scripts/run_sim.sh
+W Pythonie powstał golden model, czyli wzorcowy model, który liczy dokładnie to samo co sprzęt, na tych samych liczbach całkowitych. Automatyczne testbenche w symulatorze GHDL podają te same obrazki do układu VHDL i porównują każdą liczbę wyniku z modelem. Jeśli choć jeden bit się różni, test kończy się błędem.
+
+Struktura projektu
+python/        trening sieci, kwantyzacja, eksport wag, program do komunikacji z płytką
+rtl/           kod VHDL układu (pamięci, blok MAC, sieć, UART, wyświetlacz)
+sim/           testbenche i skrypt uruchamiający symulację
+constraints/   przypisanie pinów płytki Nexys A7
+scripts/       skrypty Tcl do automatycznego zbudowania projektu w Vivado
+mem/           wytrenowane wagi sieci
+docs/          szczegółowa dokumentacja te
